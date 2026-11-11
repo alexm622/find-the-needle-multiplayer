@@ -10,21 +10,25 @@ const COUNTED := ["straw_move", "straw_add", "straw_del", "straw_census",
 	"belts", "hay", "hay_sums", "state_delta"]
 
 var _f: FileAccess = null
+var _path := ""
 var _t := 0.0
 var _frames := 0
 var _dirty := false
 var _counts := {}
 
 func start(version: String) -> void:
+	_path = PATH
+	if OS.get_environment("MP_DESYNC") != "":
+		_path = "user://mp_trace_%d.log" % OS.get_process_id()
 	var dir := DirAccess.open("user://")
-	if dir != null and dir.file_exists(PATH.get_file()):
-		dir.rename(PATH.get_file(), PREV.get_file())
+	if dir != null and dir.file_exists(_path.get_file()):
+		dir.rename(_path.get_file(), _path.get_file() + ".prev")
 	_open()
 	note("start mod %s, engine %s, %s" % [version, Engine.get_version_info().get("string", "?"),
 		Time.get_datetime_string_from_system(true)])
 
 func _open() -> void:
-	_f = FileAccess.open(PATH, FileAccess.WRITE)
+	_f = FileAccess.open(_path if _path != "" else PATH, FileAccess.WRITE)
 
 func note(text: String) -> void:
 	if _f == null:
