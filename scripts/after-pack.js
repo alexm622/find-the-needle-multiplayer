@@ -4,7 +4,7 @@ const fs = require('fs');
 const { flipFuses, FuseVersion, FuseV1Options } = require('@electron/fuses');
 const rcedit = require('rcedit');
 
-async function applyIcon(exe, icon) {
+async function applyIcon(exe, icon, version) {
   if (!fs.existsSync(exe) || !fs.existsSync(icon)) return;
   await rcedit(exe, {
     icon,
@@ -14,8 +14,8 @@ async function applyIcon(exe, icon) {
       ProductName: 'Find The Needle',
       LegalCopyright: AUTHOR,
     },
-    'product-version': '1.0.1',
-    'file-version': '1.0.1',
+    'product-version': version,
+    'file-version': version,
   });
 }
 
@@ -30,7 +30,7 @@ exports.default = async function afterPack(context) {
     ? steamIcon
     : path.join(buildDir, 'icon.ico');
 
-  await applyIcon(exe, icon);
+  await applyIcon(exe, icon, context.packager.appInfo.version);
 
   await flipFuses(exe, {
     version: FuseVersion.V1,
