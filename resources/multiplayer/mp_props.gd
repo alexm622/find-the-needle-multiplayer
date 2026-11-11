@@ -27,6 +27,10 @@ var _sent := {}
 var _hash := {}
 var _goal := {}
 var _want := {}
+var _recent := {}
+var _rx_at := {}
+var _vel := {}
+var _pending_added: Array = []
 var _next := 0
 var _ready_map := false
 var _busy := false
@@ -129,6 +133,8 @@ func _forget(id: int) -> void:
 	_sent.erase(id)
 	_hash.erase(id)
 	_goal.erase(id)
+	_rx_at.erase(id)
+	_vel.erase(id)
 
 func _puppet(item: Node) -> void:
 	item.set_meta("mp_copy", true)
@@ -186,14 +192,94 @@ func host_take(item: Variant) -> bool:
 func _on_added(item: Node) -> void:
 	if _busy or not _ready_map or item.has_meta("mp_id"):
 		return
-	var id := _new_id()
+	if not item.is_inside_tree():
+		_pending_added.append(item)
+		return
+	_handle_added(item)
+
+func _handle_added(item: Node) -> void:
+	if _busy or not _ready_map or item.has_meta("mp_id"):
+		return
+	var dup := _foreign_dup(item)
+	if dup != 0:
+		_busy = true
+		props.remove(item)
+		_busy = false
+		if mp.dsync:
+			mp.dnote("suppressed local spawn %s at (%.2f,%.2f,%.2f): dup of just-rx id=%d" % [item.item_id, item.global_position.x, item.global_position.y, item.global_position.z, dup])
+		return
+	if not mp.is_host and not item.is_held() and _at_machine(item):
+		_busy = true
+		props.remove(item)
+		_busy = false
+		if mp.dsync:
+			mp.dnote("suppressed machine-origin spawn %s at (%.2f,%.2f,%.2f)" % [item.item_id, item.global_position.x, item.global_position.y, item.global_position.z])
+		return
+	var reused := _reuse_id(item)
+	var id := reused if reused != 0 else _new_id()
 	_adopt(item, id, _me())
 	_sent[id] = item.global_transform
 	var st := _state_of(item)
 	_hash[id] = st.hash()
 	if _log:
 		print("[MPPROPS] made %s id=%d at %v" % [item.item_id, id, item.global_position])
+	if mp.dsync:
+		mp.dnote("tx add id=%d item=%s pos=(%.2f,%.2f,%.2f) reused=%s" % [id, item.item_id, item.global_position.x, item.global_position.y, item.global_position.z, reused != 0])
+	if reused != 0:
+		return
 	mp._rx_prop_add.rpc(id, String(item.item_id), item.global_transform, st)
+
+func _at_machine(item: Node) -> bool:
+	var ws: Variant = mp.world_sync if mp != null else null
+	var ms: Variant = ws.machines_sync if ws != null and is_instance_valid(ws) else null
+	if ms == null or not is_instance_valid(ms):
+		return false
+	var pos: Vector3 = (item as Node3D).global_position
+	var near: String = ms.nearest_group(pos, 8.0)
+	if near != "" and mp.dsync:
+		mp.dnote("spawn near machine group=%s item=%s at (%.2f,%.2f,%.2f)" % [near, item.item_id, pos.x, pos.y, pos.z])
+	var pl: Variant = world.get("player") if world != null and is_instance_valid(world) else null
+	if pl != null and is_instance_valid(pl) and (pl as Node3D).global_position.distance_to(pos) < 6.0:
+		return false
+	return ms.near_machine(pos)
+
+func _foreign_dup(item: Node) -> int:
+	var now := Time.get_ticks_msec()
+	if _rx_at.size() > 512:
+		for id in _rx_at.keys():
+			if now - int(_rx_at[id]) > 2000:
+				_rx_at.erase(id)
+	for id in _by_id:
+		if int(_owner.get(id, 0)) == _me():
+			continue
+		var at: Variant = _rx_at.get(id)
+		if at == null or now - int(at) > 2000:
+			continue
+		var it: Variant = _by_id[id]
+		if it == null or not is_instance_valid(it):
+			continue
+		if String(it.item_id) != String(item.item_id):
+			continue
+		if (it as Node3D).global_position.distance_to(item.global_position) > 1.5:
+			continue
+		return int(id)
+	return 0
+
+func _reuse_id(item: Node) -> int:
+	var now := Time.get_ticks_msec()
+	for id in _recent.keys():
+		var r: Dictionary = _recent[id]
+		if now - int(r.get("t", 0)) > 2000:
+			_recent.erase(id)
+			continue
+		if String(r.get("item", "")) != String(item.item_id):
+			continue
+		var rp: Vector3 = r.get("pos", Vector3.ZERO)
+		if item.global_position.distance_to(rp) > 4.0:
+			continue
+		_recent.erase(id)
+		return int(id)
+	return 0
 
 func _on_removed(item: Node) -> void:
 	if not item.has_meta("mp_id"):
@@ -205,6 +291,8 @@ func _on_removed(item: Node) -> void:
 		return
 	if _log:
 		print("[MPPROPS] lost %s id=%d mine=%s" % [item.item_id, id, mine])
+	if mp.dsync:
+		mp.dnote("tx del id=%d item=%s mine=%s boarded=%s" % [id, item.item_id, mine, _boarded.has(id)])
 	if mine and _boarded.has(id):
 
 		mp._rx_prop_board.rpc_id(1, id, _boarded[id])
@@ -218,6 +306,14 @@ func _on_removed(item: Node) -> void:
 	else:
 
 		_want[id] = 0
+		_recent[id] = {
+			"item": String(item.item_id),
+			"pos": item.global_position,
+			"t": Time.get_ticks_msec(),
+		}
+		mp._rx_prop_claim.rpc(id)
+		if mp.dsync:
+			mp.dnote("puppet removed id=%d item=%s -> claim, awaiting re-adopt" % [id, item.item_id])
 
 func _on_carry_changed(item: Variant) -> void:
 
@@ -264,6 +360,8 @@ func _hand_rider(rb: Node) -> void:
 	mp._rx_prop_board.rpc_id(1, id, xf)
 
 func on_board(sender: int, id: int, xf: Transform3D) -> void:
+	if mp.dsync:
+		mp.dnote("board take id=%d from=%d pos=(%.2f,%.2f,%.2f)" % [id, sender, xf.origin.x, xf.origin.y, xf.origin.z])
 	var it: Variant = _by_id.get(id)
 	if it == null or not is_instance_valid(it) or int(_owner.get(id, 0)) != sender:
 		return
@@ -315,6 +413,16 @@ func _state_of(item: Node) -> Dictionary:
 
 func _process(delta: float) -> void:
 	_smooth(delta)
+	if not _pending_added.is_empty():
+		var still: Array = []
+		for it in _pending_added:
+			if not is_instance_valid(it):
+				continue
+			if (it as Node).is_inside_tree():
+				_handle_added(it)
+			else:
+				still.append(it)
+		_pending_added = still
 	_held_t += delta
 	if _held_t >= HELD_TICK:
 		_held_t = 0.0
@@ -415,13 +523,15 @@ func _smooth(delta: float) -> void:
 	var done: Array = []
 	for id in _goal:
 		var it: Variant = _by_id.get(id)
-		if it == null or not is_instance_valid(it):
+		if it == null or not is_instance_valid(it) or not (it as Node).is_inside_tree():
 			done.append(id)
 			continue
 		if _pushed.has(id):
 
 			continue
 		var want: Transform3D = _goal[id]
+		if _vel.has(id):
+			want.origin += _vel[id] * 0.1
 		var step: Transform3D = it.global_transform.interpolate_with(want, f)
 		_place(it, step)
 		if step.origin.distance_to(want.origin) < 0.002:
@@ -433,6 +543,7 @@ func _smooth(delta: float) -> void:
 func _move_tick() -> void:
 	var ids := PackedInt64Array()
 	var xfs: Array = []
+	var lvs := PackedFloat32Array()
 	for id in _by_id:
 		var it: Variant = _by_id[id]
 
@@ -445,10 +556,14 @@ func _move_tick() -> void:
 		_sent[id] = xf
 		ids.append(id)
 		xfs.append(xf)
+		var v: Vector3 = (it as RigidBody3D).linear_velocity if it is RigidBody3D else Vector3.ZERO
+		lvs.append(v.x)
+		lvs.append(v.y)
+		lvs.append(v.z)
 		if ids.size() >= MOVE_BUDGET:
 			break
 	if ids.size() > 0:
-		mp._rx_prop_move.rpc(ids, xfs)
+		mp._rx_prop_move.rpc(ids, xfs, lvs)
 	if not _want.is_empty():
 		var asking := PackedInt64Array()
 		for id in _want:
@@ -482,13 +597,37 @@ func _state_tick() -> void:
 		mp._rx_prop_state.rpc(ids, states)
 
 func _census_tick() -> void:
+	if mp.dsync:
+		_dsync_note()
 	var ids := PackedInt64Array()
 	for id in _by_id:
 		if _mine(id) and is_instance_valid(_by_id[id]):
 			ids.append(id)
 	mp._rx_prop_census.rpc(ids)
 
+func _dsync_note() -> void:
+	var n := 0
+	var mine := 0
+	var sum := 0
+	var chk := 0
+	for id in _by_id:
+		var it: Variant = _by_id[id]
+		if it == null or not is_instance_valid(it):
+			continue
+		if not (it as Node).is_inside_tree():
+			continue
+		n += 1
+		sum += int(id)
+		if _mine(int(id)):
+			mine += 1
+		var p: Vector3 = it.global_position
+		var q := int(p.x * 4.0) * 7 + int(p.y * 4.0) * 131 + int(p.z * 4.0) * 313
+		chk = (chk * 31 + (int(id) ^ q)) & 0x7FFFFFFF
+	mp.dnote("props n=%d mine=%d sum=%d chk=%08X" % [n, mine, sum, chk])
+
 func on_add(sender: int, id: int, item_id: String, xf: Transform3D, state: Dictionary) -> void:
+	if sender != _me():
+		_rx_at[id] = Time.get_ticks_msec()
 	var have: Variant = _by_id.get(id)
 	if have != null and is_instance_valid(have):
 		_goal[id] = xf
@@ -513,7 +652,7 @@ func on_del(ids: PackedInt64Array) -> void:
 			props.remove(it)
 			_busy = false
 
-func on_move(sender: int, ids: PackedInt64Array, xfs: Array) -> void:
+func on_move(sender: int, ids: PackedInt64Array, xfs: Array, lvs: PackedFloat32Array) -> void:
 	for i in ids.size():
 		var id: int = ids[i]
 		if _mine(id):
@@ -528,6 +667,12 @@ func on_move(sender: int, ids: PackedInt64Array, xfs: Array) -> void:
 		if it.is_held():
 			continue
 		_goal[id] = xfs[i]
+		if lvs.size() >= (i + 1) * 3:
+			var v := Vector3(lvs[i * 3], lvs[i * 3 + 1], lvs[i * 3 + 2])
+			if v.length_squared() > 0.25:
+				_vel[id] = v
+			else:
+				_vel.erase(id)
 
 func on_state(sender: int, ids: PackedInt64Array, states: Array) -> void:
 	for i in ids.size():
@@ -573,6 +718,8 @@ func on_want(sender: int, ids: PackedInt64Array) -> void:
 			it.global_transform, _state_of(it))
 
 func on_census(sender: int, ids: PackedInt64Array) -> void:
+	if mp.dsync:
+		mp.dnote("census from=%d theirs=%d mine_total=%d" % [sender, ids.size(), _by_id.size()])
 	var theirs := {}
 	for id in ids:
 		theirs[id] = true

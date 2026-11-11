@@ -32,6 +32,7 @@ var i18n: RefCounted = null
 var steam: Node = null
 var over_steam := false
 var trace: Node = null
+var dsync := false
 var pending_pile_size: Variant = null
 var pending_menu_action := ""
 
@@ -51,6 +52,7 @@ func _ready() -> void:
 	trace.name = "MPTrace"
 	add_child(trace)
 	trace.start(VERSION)
+	dsync = OS.get_environment("MP_DESYNC") != ""
 	i18n = load(base_dir + "/mp_i18n.gd").new()
 	_load_settings()
 	_mp_guard_online_services()
@@ -92,6 +94,11 @@ func _trace(what: String, size: int = -1) -> void:
 
 func t(key: String) -> String:
 	return i18n.t(key)
+
+func dnote(s: String) -> void:
+	if not dsync or trace == null:
+		return
+	trace.note("[%s/%d] %s" % ["host" if is_host else "guest", OS.get_process_id() % 100000, s])
 
 func _process(_delta: float) -> void:
 	var cs := get_tree().current_scene
@@ -671,6 +678,12 @@ func _rx_builds(adds: Array, removes: Array) -> void:
 		world_sync.on_builds(adds, removes)
 
 @rpc("any_peer", "call_remote", "reliable", 0)
+func _rx_build_content(dicts: Array) -> void:
+	_trace("build_content", dicts.size())
+	if world_sync != null:
+		world_sync.on_guest_content(multiplayer.get_remote_sender_id(), dicts)
+
+@rpc("any_peer", "call_remote", "reliable", 0)
 func _rx_state_delta(seq: int, delta: Dictionary) -> void:
 	_trace("state_delta", delta.size())
 	if is_host and world_sync != null:
@@ -726,6 +739,7 @@ func _props() -> Node:
 @rpc("any_peer", "call_remote", "reliable", 0)
 func _rx_prop_add(id: int, item_id: String, xf: Transform3D, state: Dictionary) -> void:
 	_trace("prop_add", state.size())
+	dnote("rx add id=%d item=%s pos=(%.2f,%.2f,%.2f)" % [id, item_id, xf.origin.x, xf.origin.y, xf.origin.z])
 	var p := _props()
 	if p != null:
 		p.on_add(multiplayer.get_remote_sender_id(), id, item_id, xf, state)
@@ -733,16 +747,17 @@ func _rx_prop_add(id: int, item_id: String, xf: Transform3D, state: Dictionary) 
 @rpc("any_peer", "call_remote", "reliable", 0)
 func _rx_prop_del(ids: PackedInt64Array) -> void:
 	_trace("prop_del", ids.size())
+	dnote("rx del ids=%s" % str(ids))
 	var p := _props()
 	if p != null:
 		p.on_del(ids)
 
 @rpc("any_peer", "call_remote", "unreliable_ordered", 0)
-func _rx_prop_move(ids: PackedInt64Array, xfs: Array) -> void:
+func _rx_prop_move(ids: PackedInt64Array, xfs: Array, lvs: PackedFloat32Array) -> void:
 	_trace("prop_move", ids.size())
 	var p := _props()
 	if p != null:
-		p.on_move(multiplayer.get_remote_sender_id(), ids, xfs)
+		p.on_move(multiplayer.get_remote_sender_id(), ids, xfs, lvs)
 
 @rpc("any_peer", "call_remote", "reliable", 0)
 func _rx_prop_state(ids: PackedInt64Array, states: Array) -> void:
@@ -761,6 +776,7 @@ func _rx_prop_claim(id: int) -> void:
 @rpc("any_peer", "call_remote", "reliable", 0)
 func _rx_prop_board(id: int, xf: Transform3D) -> void:
 	_trace("prop_board")
+	dnote("rx board id=%d pos=(%.2f,%.2f,%.2f)" % [id, xf.origin.x, xf.origin.y, xf.origin.z])
 	var p := _props()
 	if p != null and is_host:
 		p.on_board(multiplayer.get_remote_sender_id(), id, xf)
@@ -782,6 +798,7 @@ func _rx_prop_census(ids: PackedInt64Array) -> void:
 @rpc("authority", "call_remote", "reliable", 0)
 func _rx_prop_reset(first: bool, ids: PackedInt64Array, owners: PackedInt32Array, entries: Array) -> void:
 	_trace("prop_reset", ids.size())
+	dnote("rx reset n=%d first=%s" % [ids.size(), first])
 	var p := _props()
 	if p != null:
 		p.on_reset(first, ids, owners, entries)

@@ -61,6 +61,27 @@ var _hay_t := 0.0
 var _hay_scan_t := 0.0
 
 var _bkeys := {}
+var _content_t := 0.0
+var _content_dirty := false
+var _content_hashes := {}
+var _content_dicts := {}
+var _types_dumped := false
+var _adaptive_ignore := {}
+var _key_rates := {}
+
+# Live machine runtime already synced via machine FIELDS/SETTINGS - never
+# trigger build rebuilds for these. Everything else (contents, recipe, jam,
+# shape/size) is fair game for the content channel.
+# Content sync disabled (log-only): generic build-dict diffing destabilized the
+# sim - guest state (possibly wedged by half-spawned items) got rebuilt onto the
+# host, killing power grid continuity and reverting machine settings. Discovery
+# logging stays so targeted whitelists (recipe/jam/contents) can replace it.
+const CONTENT_SYNC_ENABLED := false
+
+const CONTENT_IGNORE := ["fuel", "stored", "queued", "made_kw", "next_side",
+	"forced_side", "priority_side", "aim", "power", "cooldown", "banked",
+	"charge", "tank", "loads", "brightness", "throw_distance",
+	"stored_strands", "stored_bricks", "accept_mask", "tier_index"]
 var _builds_dirty := false
 var _build_t := 0.0
 var _applying_builds := false
@@ -218,6 +239,10 @@ func _process(delta: float) -> void:
 	if _pose_t >= 1.0 / POSE_HZ:
 		_pose_t = 0.0
 		_send_pose()
+	_content_t += delta
+	if _content_t >= 1.0:
+		_content_t = 0.0
+		_content_tick()
 	if _frozen:
 		return
 	if not _tech_queue.is_empty():
@@ -453,9 +478,120 @@ func on_hay_want(pid: int, blocks: PackedInt32Array) -> void:
 		mp._rx_hay.rpc_id(pid, idx.slice(at, end), vals.slice(at, end))
 		at = end
 
+func _content_tick() -> void:
+	if not _content_dirty or builds == null or not is_instance_valid(builds) or _applying_builds:
+		return
+	_content_dirty = false
+	var cur := _scan_builds()
+	if mp.dsync and not _types_dumped:
+		_types_dumped = true
+		var types := {}
+		for k in cur:
+			var t: String = str(cur[k].get("type", "?"))
+			types[t] = int(types.get(t, 0)) + 1
+		for t in types:
+			mp.dnote("build types: %s x%d" % [t, int(types[t])])
+	var adds: Array = []
+	var removes: Array = []
+	var now := Time.get_ticks_msec()
+	for k in cur:
+		var d: Dictionary = cur[k]
+		var h: int = hash(str(d))
+		var was: Variant = _content_hashes.get(k)
+		if was != null and int(was) != h:
+			var old: Dictionary = _content_dicts.get(k, {})
+			var btype: String = str(d.get("type", "?"))
+			var changed := PackedStringArray()
+			var hot := false
+			for ck in d:
+				if str(old.get(ck, "\u0000")) != str(d[ck]):
+					var ck_s := String(ck)
+					changed.append(ck_s)
+					if CONTENT_IGNORE.has(ck_s) or _adaptive_ignore.has(btype + "|" + ck_s):
+						continue
+					var rk: String = btype + "|" + ck_s
+					var rec: Dictionary = _key_rates.get(rk, {"n": 0, "t": now})
+					if now - int(rec["t"]) > 20000:
+						rec = {"n": 0, "t": now}
+					rec["n"] = int(rec["n"]) + 1
+					_key_rates[rk] = rec
+					if int(rec["n"]) > 8:
+						_adaptive_ignore[rk] = true
+						if mp.dsync:
+							mp.dnote("content key auto-ignored (too hot): %s" % rk)
+					hot = true
+			if hot:
+				if mp.dsync:
+					mp.dnote("build content change type=%s keys=[%s] mine=%s" % [btype, ",".join(changed), mp.is_host])
+				removes.append(old)
+				adds.append(d)
+		_content_hashes[k] = h
+		_content_dicts[k] = d
+	for k in _content_hashes.keys():
+		if not cur.has(k):
+			_content_hashes.erase(k)
+			_content_dicts.erase(k)
+	if adds.is_empty():
+		return
+	if not CONTENT_SYNC_ENABLED:
+		return
+	if mp.is_host:
+		mp._rx_builds.rpc(adds, removes)
+	else:
+		var payload: Array = []
+		for d in adds:
+			payload.append(d)
+		mp._rx_build_content.rpc_id(1, payload)
+
+func on_guest_content(sender: int, dicts: Array) -> void:
+	if not CONTENT_SYNC_ENABLED:
+		return
+	if not mp.is_host or not mp.players.has(sender):
+		return
+	if _applying_builds or builds == null or not is_instance_valid(builds):
+		return
+	var cur := _scan_builds()
+	var adds: Array = []
+	var removes: Array = []
+	for d in dicts:
+		if not (d is Dictionary):
+			continue
+		var k := _bkey(d)
+		if cur.has(k):
+			removes.append(cur[k])
+		adds.append(d)
+	if adds.is_empty():
+		return
+	if mp.dsync:
+		mp.dnote("guest content from %d: %d dicts" % [sender, adds.size()])
+	_apply_content(adds, removes)
+
+func _apply_content(adds: Array, removes: Array) -> void:
+	_applying_builds = true
+	for d in removes:
+		if d is Dictionary:
+			var n := _find_building(d)
+			if n != null:
+				_demolish(n)
+	if not adds.is_empty():
+		await _add_buildings(adds)
+	_bkeys = _scan_builds()
+	_applying_builds = false
+	if _is_client():
+		_refresh_content_snapshot()
+
+func _refresh_content_snapshot() -> void:
+	var cur := _scan_builds()
+	_content_hashes.clear()
+	_content_dicts.clear()
+	for k in cur:
+		_content_hashes[k] = hash(str(cur[k]))
+		_content_dicts[k] = cur[k]
+
 func _on_builds_changed() -> void:
 	if not _applying_builds:
 		_builds_dirty = true
+		_content_dirty = true
 
 	if _is_client():
 		_freeze_client_machines.call_deferred()
@@ -509,6 +645,8 @@ func _flush_builds() -> void:
 		_freeze_client_machines()
 
 func on_builds(adds: Array, removes: Array) -> void:
+	if mp.dsync and (not adds.is_empty() or not removes.is_empty()):
+		mp.dnote("rx builds +%d -%d" % [adds.size(), removes.size()])
 	if builds == null or _frozen:
 		return
 	while _applying_builds:
@@ -528,6 +666,7 @@ func on_builds(adds: Array, removes: Array) -> void:
 	_bkeys = _scan_builds()
 	_builds_dirty = false
 	_applying_builds = false
+	_refresh_content_snapshot()
 	mp.trace.note("builds end")
 	if _is_client():
 		_freeze_client_machines()
@@ -924,7 +1063,12 @@ func send_full_sync(pid: int) -> void:
 	for idx in _holder:
 		if not bodies.has(idx):
 			needles.append([idx, Vector3.ZERO, int(_holder[idx])])
-	mp._rx_full_sync.rpc_id(pid, field.heights, builds.to_array(), Tech.to_dict(), needles)
+	if mp.dsync:
+		var b_arr: Array = builds.to_array()
+		mp.dnote("tx full heights=%d hh=%08X builds=%d needles=%d" % [field.heights.size(), hash(field.heights), b_arr.size(), needles.size()])
+		mp._rx_full_sync.rpc_id(pid, field.heights, b_arr, Tech.to_dict(), needles)
+	else:
+		mp._rx_full_sync.rpc_id(pid, field.heights, builds.to_array(), Tech.to_dict(), needles)
 	if props_sync != null and is_instance_valid(props_sync):
 		props_sync.send_all(pid)
 	if belts_sync != null and is_instance_valid(belts_sync):
@@ -935,6 +1079,8 @@ func send_full_sync(pid: int) -> void:
 		machines_sync.send_all(pid)
 
 func on_full_sync(heights: PackedFloat32Array, host_builds: Array, tech: Dictionary, needles: Array = []) -> void:
+	if mp.dsync:
+		mp.dnote("rx full heights=%d hh=%08X builds=%d needles=%d" % [heights.size(), hash(heights), host_builds.size(), needles.size()])
 
 	if _is_client():
 		_state_tick()
@@ -976,6 +1122,8 @@ func on_full_sync(heights: PackedFloat32Array, host_builds: Array, tech: Diction
 	_st_base = _capture_state()
 
 func _on_pile_replaced() -> void:
+	if mp.dsync:
+		mp.dnote("pile replaced seed=%s" % str(GameState.run_seed))
 	if not mp.active():
 		_pile_seed = GameState.run_seed
 		return

@@ -3,6 +3,7 @@ const AUTHOR := "lionrealone"
 
 const TICK := 0.1
 const FIELD_TICK := 0.5
+const FIELDS_HEARTBEAT := 2.5
 const EDIT_TICK := 0.2
 const FULL_TICK := 2.0
 const RANGE := 32.0
@@ -31,6 +32,7 @@ const FIELDS := {
 	"boreholes": ["switched_off"],
 	"dump_hatches": ["stored"],
 	"needle_radars": ["cooldown"],
+	"cabinets": ["stored"],
 	"work_lamps": ["brightness", "_off"],
 }
 
@@ -55,6 +57,8 @@ const SETTINGS := {
 	"briquette_presses": ["switched_off"],
 	"wrappers": ["switched_off"],
 	"boreholes": ["switched_off"],
+	"dump_hatches": ["switched_off", "stored"],
+	"cabinets": ["switched_off", "stored"],
 	"work_lamps": ["brightness", "_off"],
 }
 
@@ -69,6 +73,7 @@ var _sent := {}
 var _full := false
 var _refresh_t := 0.0
 var _log := OS.get_environment("MP_DEBUG_PROPS") != ""
+var _dumped := false
 var _fx := {}
 var _fx_sent := {}
 var _flags := {}
@@ -79,6 +84,7 @@ var _group := {}
 var _scan_t := 0.0
 var _t := 0.0
 var _field_t := 0.0
+var _hb_t := 0.0
 var _edit_t := 0.0
 var _mouth_t := 0.0
 var _theirs := {}
@@ -118,6 +124,8 @@ func _rescan() -> void:
 	var ws: Node = mp.world_sync
 	var groups: Array = ws.get_script().get_script_constant_map().get("CLIENT_FROZEN", [])
 	_nodes.clear()
+	if mp.dsync:
+		_dump_discovery(groups)
 
 	_parts.clear()
 	_fx.clear()
@@ -141,6 +149,72 @@ func _rescan() -> void:
 	for key in _alias.keys():
 		if not _nodes.has(_alias[key]):
 			_alias.erase(key)
+
+func _dump_discovery(known_groups: Array) -> void:
+	if _dumped or builds == null or not is_instance_valid(builds):
+		return
+	_dumped = true
+	var known := {}
+	for g in FIELDS.keys() + SETTINGS.keys() + SETTINGS_ONLY + known_groups:
+		known[String(g)] = true
+	for g in known:
+		var arr: Variant = builds.get(g)
+		if not (arr is Array) or arr.is_empty():
+			continue
+		var first: Node3D = arr[0] if arr[0] is Node3D else null
+		var at: String = "(%.1f,%.1f,%.1f)" % [first.global_position.x, first.global_position.y, first.global_position.z] if first != null else "?"
+		mp.dnote("machines known group=%s n=%d first_at=%s" % [g, arr.size(), at])
+	var cab_arr: Variant = builds.get("cabinets")
+	if cab_arr is Array and not cab_arr.is_empty() and cab_arr[0] is Node3D:
+		var cab: Node = cab_arr[0]
+		for cand in ["stored", "contents", "items", "inventory", "stored_items", "output", "filter", "queued"]:
+			var val: Variant = cab.get(cand)
+			if val != null:
+				mp.dnote("cabinet field probe %s=%s" % [cand, str(val).substr(0, 120)])
+	for p in builds.get_property_list():
+		var g: String = String(p.get("name", ""))
+		if g == "" or g.begins_with("_") or known.has(g):
+			continue
+		var arr: Variant = builds.get(g)
+		if not (arr is Array) or arr.is_empty() or not (arr[0] is Node3D):
+			continue
+		var first: Node3D = arr[0]
+		var fields := PackedStringArray()
+		for q in first.get_property_list():
+			var fname: String = String(q.get("name", ""))
+			if fname == "" or fname.begins_with("_"):
+				continue
+			var usage: int = int(q.get("usage", 0))
+			if (usage & PROPERTY_USAGE_STORAGE) == 0:
+				continue
+			fields.append(fname)
+			if fields.size() >= 25:
+				break
+		mp.dnote("machine? group=%s class=%s n=%d fields=%s" % [g, first.get_class(), arr.size(), ", ".join(fields)])
+
+func nearest_group(pos: Vector3, max_r: float = 8.0) -> String:
+	var best := ""
+	var best_d := max_r * max_r
+	for key in _nodes:
+		var n: Variant = _nodes[key]
+		if n == null or not is_instance_valid(n) or not (n is Node3D):
+			continue
+		var d: float = (n as Node3D).global_position.distance_squared_to(pos)
+		if d < best_d:
+			best_d = d
+			best = String(_group.get(key, "?"))
+	return best
+
+func near_machine(pos: Vector3, radius: float = 3.5) -> bool:
+	for key in _nodes:
+		var n: Variant = _nodes[key]
+		if n == null or not is_instance_valid(n) or not (n is Node3D):
+			continue
+		if (n as Node3D).global_position.distance_to(pos) <= radius:
+			if mp.dsync:
+				mp.dnote("machine near spawn: group=%s key=%s" % [String(_group.get(key, "?")), key])
+			return true
+	return false
 
 func _local_key(key: String) -> String:
 	if _nodes.has(key):
@@ -254,7 +328,10 @@ func _process(delta: float) -> void:
 	_field_t += delta
 	if _field_t >= FIELD_TICK:
 		_field_t = 0.0
-		_send_fields()
+		_hb_t += FIELD_TICK
+		_send_fields(_hb_t >= FIELDS_HEARTBEAT)
+		if _hb_t >= FIELDS_HEARTBEAT:
+			_hb_t = 0.0
 	_mouth_t += delta
 	if _mouth_t >= MOUTH_TICK:
 		_mouth_t = 0.0
@@ -422,7 +499,9 @@ func _same(a: Transform3D, b: Transform3D) -> bool:
 		and a.basis.y.distance_squared_to(b.basis.y) < ANG_EPS * ANG_EPS \
 		and a.basis.z.distance_squared_to(b.basis.z) < ANG_EPS * ANG_EPS
 
-func _send_fields() -> void:
+func _send_fields(full := false) -> void:
+	if full:
+		_vals.clear()
 	var batch := {}
 	for key in _nodes:
 		var n: Variant = _nodes[key]
